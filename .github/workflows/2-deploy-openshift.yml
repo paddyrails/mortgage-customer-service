@@ -1,0 +1,268 @@
+name: 2. Deploy to OpenShift
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy'
+        required: true
+        default: 'latest'
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: mortgage/customer-service
+  SERVICE_NAME: customer-service
+  SERVICE_PORT: "5001"
+  OPENSHIFT_NAMESPACE: mortgage-app
+  REPLICAS: "2"
+
+jobs:
+  deploy:
+    name: Deploy to OpenShift
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image URI
+        id: image
+        run: |
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.event.inputs.image_tag }}"
+          echo "uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+          echo "🐳 Deploying image: ${IMAGE_URI}"
+
+      - name: Install OpenShift CLI
+        uses: redhat-actions/openshift-tools-installer@v1
+        with:
+          oc: "4.14"
+
+      - name: Login to OpenShift
+        uses: redhat-actions/oc-login@v1
+        with:
+          openshift_server_url: ${{ secrets.OPENSHIFT_SERVER }}
+          openshift_token: ${{ secrets.OPENSHIFT_TOKEN }}
+          insecure_skip_tls_verify: true
+          namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+
+      - name: Create/Update ECR Pull Secret
+        run: |
+          # Get ECR password
+          ECR_PASSWORD=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
+          ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          
+          # Delete existing secret if exists
+          oc delete secret ecr-pull-secret --ignore-not-found -n ${{ env.OPENSHIFT_NAMESPACE }}
+          
+          # Create new pull secret
+          oc create secret docker-registry ecr-pull-secret \
+            --docker-server=${ECR_REGISTRY} \
+            --docker-username=AWS \
+            --docker-password=${ECR_PASSWORD} \
+            -n ${{ env.OPENSHIFT_NAMESPACE }}
+          
+          # Link to default service account
+          oc secrets link default ecr-pull-secret --for=pull -n ${{ env.OPENSHIFT_NAMESPACE }}
+
+      - name: Create Kubernetes manifests
+        run: |
+          mkdir -p k8s
+          
+          # ConfigMap
+          cat > k8s/configmap.yaml << EOF
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: ${{ env.SERVICE_NAME }}-config
+            namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+            labels:
+              app: ${{ env.SERVICE_NAME }}
+              environment: ${{ github.event.inputs.environment }}
+          data:
+            ASPNETCORE_ENVIRONMENT: "${{ github.event.inputs.environment }}"
+            ASPNETCORE_URLS: "http://+:${{ env.SERVICE_PORT }}"
+            Logging__LogLevel__Default: "Information"
+          EOF
+
+          # Deployment
+          cat > k8s/deployment.yaml << EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${{ env.SERVICE_NAME }}
+            namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+            labels:
+              app: ${{ env.SERVICE_NAME }}
+              version: "${{ github.event.inputs.image_tag }}"
+              environment: ${{ github.event.inputs.environment }}
+          spec:
+            replicas: ${{ env.REPLICAS }}
+            selector:
+              matchLabels:
+                app: ${{ env.SERVICE_NAME }}
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxSurge: 1
+                maxUnavailable: 0
+            template:
+              metadata:
+                labels:
+                  app: ${{ env.SERVICE_NAME }}
+                  version: "${{ github.event.inputs.image_tag }}"
+                annotations:
+                  prometheus.io/scrape: "true"
+                  prometheus.io/port: "${{ env.SERVICE_PORT }}"
+              spec:
+                imagePullSecrets:
+                  - name: ecr-pull-secret
+                containers:
+                  - name: ${{ env.SERVICE_NAME }}
+                    image: ${{ steps.image.outputs.uri }}
+                    imagePullPolicy: Always
+                    ports:
+                      - containerPort: ${{ env.SERVICE_PORT }}
+                        protocol: TCP
+                    envFrom:
+                      - configMapRef:
+                          name: ${{ env.SERVICE_NAME }}-config
+                    resources:
+                      requests:
+                        memory: "256Mi"
+                        cpu: "100m"
+                      limits:
+                        memory: "512Mi"
+                        cpu: "500m"
+                    livenessProbe:
+                      httpGet:
+                        path: /api/health/live
+                        port: ${{ env.SERVICE_PORT }}
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                      timeoutSeconds: 5
+                      failureThreshold: 3
+                    readinessProbe:
+                      httpGet:
+                        path: /api/health/ready
+                        port: ${{ env.SERVICE_PORT }}
+                      initialDelaySeconds: 10
+                      periodSeconds: 5
+                      timeoutSeconds: 3
+                      failureThreshold: 3
+                    startupProbe:
+                      httpGet:
+                        path: /api/health/live
+                        port: ${{ env.SERVICE_PORT }}
+                      initialDelaySeconds: 5
+                      periodSeconds: 5
+                      failureThreshold: 30
+          EOF
+
+          # Service
+          cat > k8s/service.yaml << EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${{ env.SERVICE_NAME }}
+            namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+            labels:
+              app: ${{ env.SERVICE_NAME }}
+          spec:
+            type: ClusterIP
+            ports:
+              - port: 80
+                targetPort: ${{ env.SERVICE_PORT }}
+                protocol: TCP
+                name: http
+            selector:
+              app: ${{ env.SERVICE_NAME }}
+          EOF
+
+          # Route (OpenShift specific)
+          cat > k8s/route.yaml << EOF
+          apiVersion: route.openshift.io/v1
+          kind: Route
+          metadata:
+            name: ${{ env.SERVICE_NAME }}
+            namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+            labels:
+              app: ${{ env.SERVICE_NAME }}
+          spec:
+            to:
+              kind: Service
+              name: ${{ env.SERVICE_NAME }}
+              weight: 100
+            port:
+              targetPort: http
+            tls:
+              termination: edge
+              insecureEdgeTerminationPolicy: Redirect
+            wildcardPolicy: None
+          EOF
+
+      - name: Apply Kubernetes manifests
+        run: |
+          echo "🚀 Deploying ${{ env.SERVICE_NAME }} to OpenShift..."
+          
+          oc apply -f k8s/configmap.yaml
+          oc apply -f k8s/deployment.yaml
+          oc apply -f k8s/service.yaml
+          oc apply -f k8s/route.yaml
+
+      - name: Wait for deployment rollout
+        run: |
+          echo "⏳ Waiting for deployment to complete..."
+          oc rollout status deployment/${{ env.SERVICE_NAME }} \
+            -n ${{ env.OPENSHIFT_NAMESPACE }} \
+            --timeout=300s
+
+      - name: Get deployment info
+        id: deploy-info
+        run: |
+          ROUTE_URL=$(oc get route ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} -o jsonpath='{.spec.host}')
+          echo "route_url=https://${ROUTE_URL}" >> $GITHUB_OUTPUT
+          
+          echo "✅ Deployment complete!"
+          echo "🌐 Service URL: https://${ROUTE_URL}"
+          
+          # Show pod status
+          echo ""
+          echo "📊 Pod Status:"
+          oc get pods -l app=${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }}
+
+      - name: Summary
+        run: |
+          echo "## 🚀 Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | ${{ env.SERVICE_NAME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ github.event.inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | ${{ github.event.inputs.image_tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | ${{ env.OPENSHIFT_NAMESPACE }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| URL | ${{ steps.deploy-info.outputs.route_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Endpoints" >> $GITHUB_STEP_SUMMARY
+          echo "- Swagger: ${{ steps.deploy-info.outputs.route_url }}/swagger" >> $GITHUB_STEP_SUMMARY
+          echo "- Health: ${{ steps.deploy-info.outputs.route_url }}/api/health" >> $GITHUB_STEP_SUMMARY

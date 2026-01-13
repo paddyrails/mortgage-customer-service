@@ -1,0 +1,195 @@
+name: 5. Remove from OpenShift
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      confirm_delete:
+        description: 'Type service name to confirm deletion'
+        required: true
+      delete_configmap:
+        description: 'Also delete ConfigMap'
+        required: false
+        default: true
+        type: boolean
+      delete_route:
+        description: 'Also delete Route'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  SERVICE_NAME: customer-service
+  OPENSHIFT_NAMESPACE: mortgage-app
+
+jobs:
+  remove:
+    name: Remove from OpenShift
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm_delete }}" != "${{ env.SERVICE_NAME }}" ]; then
+            echo "❌ Confirmation failed!"
+            echo "Expected: ${{ env.SERVICE_NAME }}"
+            echo "Received: ${{ github.event.inputs.confirm_delete }}"
+            exit 1
+          fi
+          echo "✅ Deletion confirmed for ${{ env.SERVICE_NAME }}"
+
+      - name: Install OpenShift CLI
+        uses: redhat-actions/openshift-tools-installer@v1
+        with:
+          oc: "4.14"
+
+      - name: Login to OpenShift
+        uses: redhat-actions/oc-login@v1
+        with:
+          openshift_server_url: ${{ secrets.OPENSHIFT_SERVER }}
+          openshift_token: ${{ secrets.OPENSHIFT_TOKEN }}
+          insecure_skip_tls_verify: true
+          namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+
+      - name: Pre-deletion status
+        run: |
+          echo "📋 Current resources for ${{ env.SERVICE_NAME }}:"
+          echo ""
+          echo "Deployment:"
+          oc get deployment ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} 2>/dev/null || echo "  Not found"
+          echo ""
+          echo "Service:"
+          oc get service ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} 2>/dev/null || echo "  Not found"
+          echo ""
+          echo "Route:"
+          oc get route ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} 2>/dev/null || echo "  Not found"
+          echo ""
+          echo "ConfigMap:"
+          oc get configmap ${{ env.SERVICE_NAME }}-config -n ${{ env.OPENSHIFT_NAMESPACE }} 2>/dev/null || echo "  Not found"
+          echo ""
+          echo "Pods:"
+          oc get pods -l app=${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} 2>/dev/null || echo "  None found"
+
+      - name: Scale down deployment
+        run: |
+          echo "⬇️ Scaling down deployment to 0 replicas..."
+          oc scale deployment/${{ env.SERVICE_NAME }} --replicas=0 -n ${{ env.OPENSHIFT_NAMESPACE }} 2>/dev/null || echo "Deployment not found, skipping scale down"
+          
+          # Wait for pods to terminate
+          sleep 5
+          
+          echo "Waiting for pods to terminate..."
+          oc wait --for=delete pod -l app=${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} --timeout=60s 2>/dev/null || echo "No pods to wait for"
+
+      - name: Delete Route
+        if: github.event.inputs.delete_route == 'true'
+        run: |
+          echo "🗑️ Deleting Route..."
+          oc delete route ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} --ignore-not-found=true
+          echo "✅ Route deleted"
+
+      - name: Delete Service
+        run: |
+          echo "🗑️ Deleting Service..."
+          oc delete service ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} --ignore-not-found=true
+          echo "✅ Service deleted"
+
+      - name: Delete Deployment
+        run: |
+          echo "🗑️ Deleting Deployment..."
+          oc delete deployment ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} --ignore-not-found=true
+          echo "✅ Deployment deleted"
+
+      - name: Delete ConfigMap
+        if: github.event.inputs.delete_configmap == 'true'
+        run: |
+          echo "🗑️ Deleting ConfigMap..."
+          oc delete configmap ${{ env.SERVICE_NAME }}-config -n ${{ env.OPENSHIFT_NAMESPACE }} --ignore-not-found=true
+          echo "✅ ConfigMap deleted"
+
+      - name: Delete HorizontalPodAutoscaler (if exists)
+        run: |
+          echo "🗑️ Checking for HPA..."
+          oc delete hpa ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} --ignore-not-found=true
+
+      - name: Delete PodDisruptionBudget (if exists)
+        run: |
+          echo "🗑️ Checking for PDB..."
+          oc delete pdb ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} --ignore-not-found=true
+
+      - name: Verify deletion
+        run: |
+          echo "🔍 Verifying deletion..."
+          echo ""
+          
+          RESOURCES_REMAINING=0
+          
+          # Check deployment
+          if oc get deployment ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} 2>/dev/null; then
+            echo "⚠️ Deployment still exists"
+            RESOURCES_REMAINING=$((RESOURCES_REMAINING + 1))
+          else
+            echo "✅ Deployment removed"
+          fi
+          
+          # Check service
+          if oc get service ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} 2>/dev/null; then
+            echo "⚠️ Service still exists"
+            RESOURCES_REMAINING=$((RESOURCES_REMAINING + 1))
+          else
+            echo "✅ Service removed"
+          fi
+          
+          # Check route
+          if oc get route ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} 2>/dev/null; then
+            echo "⚠️ Route still exists"
+            RESOURCES_REMAINING=$((RESOURCES_REMAINING + 1))
+          else
+            echo "✅ Route removed"
+          fi
+          
+          # Check pods
+          POD_COUNT=$(oc get pods -l app=${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} --no-headers 2>/dev/null | wc -l)
+          if [ "$POD_COUNT" -gt 0 ]; then
+            echo "⚠️ ${POD_COUNT} pods still exist"
+            RESOURCES_REMAINING=$((RESOURCES_REMAINING + 1))
+          else
+            echo "✅ All pods removed"
+          fi
+          
+          echo ""
+          if [ "$RESOURCES_REMAINING" -eq 0 ]; then
+            echo "🎉 All resources successfully removed!"
+          else
+            echo "⚠️ ${RESOURCES_REMAINING} resource(s) may still exist"
+          fi
+
+      - name: Summary
+        run: |
+          echo "## 🗑️ Removal Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | ${{ env.SERVICE_NAME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ github.event.inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | ${{ env.OPENSHIFT_NAMESPACE }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deleted Resources" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Service" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.delete_route }}" == "true" ]; then
+            echo "- ✅ Route" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ "${{ github.event.inputs.delete_configmap }}" == "true" ]; then
+            echo "- ✅ ConfigMap" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "- ✅ Pods" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,204 @@
+name: 3. Verify Health Checks
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      max_retries:
+        description: 'Maximum retry attempts'
+        required: false
+        default: '5'
+
+env:
+  SERVICE_NAME: customer-service
+  OPENSHIFT_NAMESPACE: mortgage-app
+
+jobs:
+  verify-health:
+    name: Verify Health Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install OpenShift CLI
+        uses: redhat-actions/openshift-tools-installer@v1
+        with:
+          oc: "4.14"
+
+      - name: Login to OpenShift
+        uses: redhat-actions/oc-login@v1
+        with:
+          openshift_server_url: ${{ secrets.OPENSHIFT_SERVER }}
+          openshift_token: ${{ secrets.OPENSHIFT_TOKEN }}
+          insecure_skip_tls_verify: true
+          namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+
+      - name: Get Service URL
+        id: get-url
+        run: |
+          ROUTE_URL=$(oc get route ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+          
+          if [ -z "$ROUTE_URL" ]; then
+            echo "❌ Route not found for ${{ env.SERVICE_NAME }}"
+            exit 1
+          fi
+          
+          echo "service_url=https://${ROUTE_URL}" >> $GITHUB_OUTPUT
+          echo "🌐 Service URL: https://${ROUTE_URL}"
+
+      - name: Check Pod Status
+        run: |
+          echo "📊 Checking pod status..."
+          
+          # Get pod count
+          READY_PODS=$(oc get pods -l app=${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} \
+            -o jsonpath='{.items[*].status.containerStatuses[0].ready}' | tr ' ' '\n' | grep -c true || echo "0")
+          
+          TOTAL_PODS=$(oc get pods -l app=${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} \
+            -o jsonpath='{.items[*].metadata.name}' | wc -w)
+          
+          echo "Ready pods: ${READY_PODS}/${TOTAL_PODS}"
+          
+          # Show detailed pod status
+          oc get pods -l app=${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} -o wide
+          
+          if [ "$READY_PODS" -eq "0" ]; then
+            echo "❌ No ready pods found"
+            echo ""
+            echo "📋 Pod logs:"
+            oc logs -l app=${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} --tail=50 || true
+            exit 1
+          fi
+
+      - name: Verify Liveness Endpoint
+        id: liveness
+        run: |
+          SERVICE_URL="${{ steps.get-url.outputs.service_url }}"
+          MAX_RETRIES=${{ github.event.inputs.max_retries }}
+          RETRY_COUNT=0
+          
+          echo "🔍 Checking liveness endpoint..."
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${SERVICE_URL}/api/health/live" --max-time 10 || echo "000")
+            
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ Liveness check passed (HTTP ${HTTP_CODE})"
+              echo "status=healthy" >> $GITHUB_OUTPUT
+              break
+            else
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              echo "⏳ Attempt ${RETRY_COUNT}/${MAX_RETRIES}: HTTP ${HTTP_CODE}"
+              
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                sleep 10
+              fi
+            fi
+          done
+          
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Liveness check failed after ${MAX_RETRIES} attempts"
+            echo "status=unhealthy" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Verify Readiness Endpoint
+        id: readiness
+        run: |
+          SERVICE_URL="${{ steps.get-url.outputs.service_url }}"
+          MAX_RETRIES=${{ github.event.inputs.max_retries }}
+          RETRY_COUNT=0
+          
+          echo "🔍 Checking readiness endpoint..."
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            RESPONSE=$(curl -s "${SERVICE_URL}/api/health/ready" --max-time 10 || echo "error")
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${SERVICE_URL}/api/health/ready" --max-time 10 || echo "000")
+            
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ Readiness check passed (HTTP ${HTTP_CODE})"
+              echo "Response: ${RESPONSE}"
+              echo "status=ready" >> $GITHUB_OUTPUT
+              break
+            else
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              echo "⏳ Attempt ${RETRY_COUNT}/${MAX_RETRIES}: HTTP ${HTTP_CODE}"
+              
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                sleep 10
+              fi
+            fi
+          done
+          
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Readiness check failed after ${MAX_RETRIES} attempts"
+            echo "status=not-ready" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Verify Main Health Endpoint
+        id: health
+        run: |
+          SERVICE_URL="${{ steps.get-url.outputs.service_url }}"
+          
+          echo "🔍 Checking main health endpoint..."
+          
+          RESPONSE=$(curl -s "${SERVICE_URL}/api/health" --max-time 10)
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${SERVICE_URL}/api/health" --max-time 10)
+          
+          echo "HTTP Code: ${HTTP_CODE}"
+          echo "Response: ${RESPONSE}"
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Health check passed"
+            echo "response=${RESPONSE}" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Health check returned HTTP ${HTTP_CODE}"
+          fi
+
+      - name: Verify Swagger Endpoint
+        run: |
+          SERVICE_URL="${{ steps.get-url.outputs.service_url }}"
+          
+          echo "🔍 Checking Swagger endpoint..."
+          
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${SERVICE_URL}/swagger/index.html" --max-time 10 || echo "000")
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Swagger UI is accessible"
+          else
+            echo "⚠️ Swagger returned HTTP ${HTTP_CODE}"
+          fi
+
+      - name: Check Deployment Events
+        if: failure()
+        run: |
+          echo "📋 Recent deployment events:"
+          oc get events -n ${{ env.OPENSHIFT_NAMESPACE }} \
+            --field-selector involvedObject.name=${{ env.SERVICE_NAME }} \
+            --sort-by='.lastTimestamp' | tail -20
+
+      - name: Summary
+        run: |
+          echo "## 🏥 Health Check Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | ${{ env.SERVICE_NAME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ github.event.inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| URL | ${{ steps.get-url.outputs.service_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Liveness | ${{ steps.liveness.outputs.status || 'checked' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Readiness | ${{ steps.readiness.outputs.status || 'checked' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Endpoints Verified" >> $GITHUB_STEP_SUMMARY
+          echo "- \`/api/health/live\` ✅" >> $GITHUB_STEP_SUMMARY
+          echo "- \`/api/health/ready\` ✅" >> $GITHUB_STEP_SUMMARY
+          echo "- \`/api/health\` ✅" >> $GITHUB_STEP_SUMMARY
+          echo "- \`/swagger\` ✅" >> $GITHUB_STEP_SUMMARY

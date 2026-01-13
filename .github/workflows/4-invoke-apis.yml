@@ -1,0 +1,289 @@
+name: 4. Invoke APIs
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      test_type:
+        description: 'Type of test to run'
+        required: true
+        default: 'smoke'
+        type: choice
+        options:
+          - smoke
+          - full
+          - crud
+
+env:
+  SERVICE_NAME: customer-service
+  OPENSHIFT_NAMESPACE: mortgage-app
+
+jobs:
+  invoke-apis:
+    name: Invoke APIs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install OpenShift CLI
+        uses: redhat-actions/openshift-tools-installer@v1
+        with:
+          oc: "4.14"
+
+      - name: Login to OpenShift
+        uses: redhat-actions/oc-login@v1
+        with:
+          openshift_server_url: ${{ secrets.OPENSHIFT_SERVER }}
+          openshift_token: ${{ secrets.OPENSHIFT_TOKEN }}
+          insecure_skip_tls_verify: true
+          namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+
+      - name: Get Service URL
+        id: get-url
+        run: |
+          ROUTE_URL=$(oc get route ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} -o jsonpath='{.spec.host}')
+          echo "service_url=https://${ROUTE_URL}" >> $GITHUB_OUTPUT
+          echo "🌐 Service URL: https://${ROUTE_URL}"
+
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      - name: Smoke Test - Health Endpoints
+        id: smoke-test
+        run: |
+          SERVICE_URL="${{ steps.get-url.outputs.service_url }}"
+          PASSED=0
+          FAILED=0
+          
+          echo "🔥 Running Smoke Tests..."
+          echo ""
+          
+          # Test 1: Health endpoint
+          echo "Test 1: GET /api/health"
+          RESPONSE=$(curl -s -w "\n%{http_code}" "${SERVICE_URL}/api/health")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ PASSED - HTTP ${HTTP_CODE}"
+            echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+            PASSED=$((PASSED + 1))
+          else
+            echo "❌ FAILED - HTTP ${HTTP_CODE}"
+            FAILED=$((FAILED + 1))
+          fi
+          echo ""
+          
+          # Test 2: Get all customers
+          echo "Test 2: GET /api/customers"
+          RESPONSE=$(curl -s -w "\n%{http_code}" "${SERVICE_URL}/api/customers")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ PASSED - HTTP ${HTTP_CODE}"
+            CUSTOMER_COUNT=$(echo "$BODY" | jq '.data | length' 2>/dev/null || echo "0")
+            echo "Found ${CUSTOMER_COUNT} customers"
+            PASSED=$((PASSED + 1))
+          else
+            echo "❌ FAILED - HTTP ${HTTP_CODE}"
+            FAILED=$((FAILED + 1))
+          fi
+          echo ""
+          
+          # Test 3: Get customer by ID (using seed data ID)
+          echo "Test 3: GET /api/customers/{id}"
+          TEST_ID="11111111-1111-1111-1111-111111111111"
+          RESPONSE=$(curl -s -w "\n%{http_code}" "${SERVICE_URL}/api/customers/${TEST_ID}")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ PASSED - HTTP ${HTTP_CODE}"
+            CUSTOMER_NAME=$(echo "$BODY" | jq -r '.data.fullName' 2>/dev/null || echo "N/A")
+            echo "Customer: ${CUSTOMER_NAME}"
+            PASSED=$((PASSED + 1))
+          else
+            echo "⚠️ SKIPPED - Customer not found (expected if no seed data)"
+          fi
+          echo ""
+          
+          echo "smoke_passed=${PASSED}" >> $GITHUB_OUTPUT
+          echo "smoke_failed=${FAILED}" >> $GITHUB_OUTPUT
+          
+          echo "📊 Smoke Test Results: ${PASSED} passed, ${FAILED} failed"
+
+      - name: Full API Test - CRUD Operations
+        id: crud-test
+        if: github.event.inputs.test_type == 'full' || github.event.inputs.test_type == 'crud'
+        run: |
+          SERVICE_URL="${{ steps.get-url.outputs.service_url }}"
+          PASSED=0
+          FAILED=0
+          
+          echo "🧪 Running CRUD Tests..."
+          echo ""
+          
+          # CREATE - New Customer
+          echo "=== CREATE: POST /api/customers ==="
+          CREATE_PAYLOAD='{
+            "firstName": "Test",
+            "lastName": "User",
+            "email": "test.user.'$(date +%s)'@example.com",
+            "phone": "+1-555-0199",
+            "ssn": "999-99-'$(shuf -i 1000-9999 -n 1)'",
+            "dateOfBirth": "1990-01-15",
+            "address": {
+              "street": "123 Test Street",
+              "city": "Test City",
+              "state": "CA",
+              "zipCode": "90210"
+            }
+          }'
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Content-Type: application/json" \
+            -d "$CREATE_PAYLOAD" \
+            "${SERVICE_URL}/api/customers")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          
+          if [ "$HTTP_CODE" = "201" ]; then
+            echo "✅ CREATE PASSED - HTTP ${HTTP_CODE}"
+            CUSTOMER_ID=$(echo "$BODY" | jq -r '.data.id')
+            echo "Created Customer ID: ${CUSTOMER_ID}"
+            PASSED=$((PASSED + 1))
+          else
+            echo "❌ CREATE FAILED - HTTP ${HTTP_CODE}"
+            echo "$BODY"
+            FAILED=$((FAILED + 1))
+            CUSTOMER_ID=""
+          fi
+          echo ""
+          
+          # READ - Get Created Customer
+          if [ -n "$CUSTOMER_ID" ] && [ "$CUSTOMER_ID" != "null" ]; then
+            echo "=== READ: GET /api/customers/${CUSTOMER_ID} ==="
+            RESPONSE=$(curl -s -w "\n%{http_code}" "${SERVICE_URL}/api/customers/${CUSTOMER_ID}")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+            
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ READ PASSED - HTTP ${HTTP_CODE}"
+              PASSED=$((PASSED + 1))
+            else
+              echo "❌ READ FAILED - HTTP ${HTTP_CODE}"
+              FAILED=$((FAILED + 1))
+            fi
+            echo ""
+            
+            # UPDATE - Update Customer
+            echo "=== UPDATE: PUT /api/customers/${CUSTOMER_ID} ==="
+            UPDATE_PAYLOAD='{"firstName": "Updated", "lastName": "Customer"}'
+            
+            RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT \
+              -H "Content-Type: application/json" \
+              -d "$UPDATE_PAYLOAD" \
+              "${SERVICE_URL}/api/customers/${CUSTOMER_ID}")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+            
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ UPDATE PASSED - HTTP ${HTTP_CODE}"
+              PASSED=$((PASSED + 1))
+            else
+              echo "❌ UPDATE FAILED - HTTP ${HTTP_CODE}"
+              FAILED=$((FAILED + 1))
+            fi
+            echo ""
+            
+            # READ Credit
+            echo "=== READ: GET /api/customers/${CUSTOMER_ID}/credit ==="
+            RESPONSE=$(curl -s -w "\n%{http_code}" "${SERVICE_URL}/api/customers/${CUSTOMER_ID}/credit")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+            
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "404" ]; then
+              echo "✅ CREDIT READ PASSED - HTTP ${HTTP_CODE}"
+              PASSED=$((PASSED + 1))
+            else
+              echo "❌ CREDIT READ FAILED - HTTP ${HTTP_CODE}"
+              FAILED=$((FAILED + 1))
+            fi
+            echo ""
+            
+            # READ Employments
+            echo "=== READ: GET /api/customers/${CUSTOMER_ID}/employments ==="
+            RESPONSE=$(curl -s -w "\n%{http_code}" "${SERVICE_URL}/api/customers/${CUSTOMER_ID}/employments")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+            
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ EMPLOYMENTS READ PASSED - HTTP ${HTTP_CODE}"
+              PASSED=$((PASSED + 1))
+            else
+              echo "❌ EMPLOYMENTS READ FAILED - HTTP ${HTTP_CODE}"
+              FAILED=$((FAILED + 1))
+            fi
+            echo ""
+            
+            # DELETE - Delete Customer
+            echo "=== DELETE: DELETE /api/customers/${CUSTOMER_ID} ==="
+            RESPONSE=$(curl -s -w "\n%{http_code}" -X DELETE "${SERVICE_URL}/api/customers/${CUSTOMER_ID}")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+            
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ DELETE PASSED - HTTP ${HTTP_CODE}"
+              PASSED=$((PASSED + 1))
+            else
+              echo "❌ DELETE FAILED - HTTP ${HTTP_CODE}"
+              FAILED=$((FAILED + 1))
+            fi
+          fi
+          
+          echo ""
+          echo "crud_passed=${PASSED}" >> $GITHUB_OUTPUT
+          echo "crud_failed=${FAILED}" >> $GITHUB_OUTPUT
+          
+          echo "📊 CRUD Test Results: ${PASSED} passed, ${FAILED} failed"
+          
+          if [ "$FAILED" -gt 0 ]; then
+            exit 1
+          fi
+
+      - name: Test Get by Email
+        if: github.event.inputs.test_type == 'full'
+        run: |
+          SERVICE_URL="${{ steps.get-url.outputs.service_url }}"
+          
+          echo "=== GET /api/customers/email/{email} ==="
+          RESPONSE=$(curl -s -w "\n%{http_code}" "${SERVICE_URL}/api/customers/email/john.doe@email.com")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          
+          echo "HTTP Code: ${HTTP_CODE}"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+      - name: Generate Test Report
+        if: always()
+        run: |
+          echo "## 🧪 API Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Test Suite | Passed | Failed |" >> $GITHUB_STEP_SUMMARY
+          echo "|------------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Smoke Tests | ${{ steps.smoke-test.outputs.smoke_passed || '0' }} | ${{ steps.smoke-test.outputs.smoke_failed || '0' }} |" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.test_type }}" != "smoke" ]; then
+            echo "| CRUD Tests | ${{ steps.crud-test.outputs.crud_passed || '0' }} | ${{ steps.crud-test.outputs.crud_failed || '0' }} |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- Service: ${{ env.SERVICE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Environment: ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Test Type: ${{ github.event.inputs.test_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- URL: ${{ steps.get-url.outputs.service_url }}" >> $GITHUB_STEP_SUMMARY
